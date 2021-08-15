@@ -2,13 +2,13 @@
 
 package chiseltest.internal
 
+import chisel3.{Clock, Data, Module}
+
 import java.util.concurrent.{ConcurrentLinkedQueue, Semaphore}
-import chiseltest.{ClockResolutionException, Region, TemporalParadox, ThreadOrderDependentException, TimeoutException}
-import chisel3._
+import chiseltest.{Region, TemporalParadox, ThreadOrderDependentException, TimeoutException}
 import chiseltest.coverage.TestCoverage
 import chiseltest.simulator.SimulatorContext
 import firrtl.AnnotationSeq
-import logger.LazyLogging
 
 import scala.collection.mutable
 
@@ -63,33 +63,19 @@ case class ForkBuilder(name: Option[String], region: Option[Region], threads: Se
 class ThreadedBackend[T <: Module](
   val dut:                T,
   val dataNames:          Map[Data, String],
-  val combinationalPaths: Map[Data, Set[Data]],
-  tester:                 SimulatorContext,
+  combinationalPaths: Map[Data, Set[Data]],
+  val tester:                 SimulatorContext,
   coverageAnnotations:    AnnotationSeq)
-    extends BackendInterface
-    with BackendInstance[T]
-    with LazyLogging {
+    extends GenericBackend[T]
+    with BackendInstance[T] {
 
-  protected def resolveName(signal: Data): String = { // TODO: unify w/ dataNames?
-    dataNames.getOrElse(signal, signal.toString)
+  override def pokeBits(signal: Data, value: BigInt): Unit = {
+    doPoke(signal, value, new Throwable)
+    if (tester.peek(dataNames(signal)) != value) {
+      idleCycles.clear()
+    }
+    super.pokeBits(signal, value)
   }
-
-  //
-  // Circuit introspection functionality
-  //
-  override def getSourceClocks(signal: Data): Set[Clock] = {
-    throw new ClockResolutionException("ICR not available on chisel-testers2 / firrtl master")
-  }
-
-  override def getSinkClocks(signal: Data): Set[Clock] = {
-    throw new ClockResolutionException("ICR not available on chisel-testers2 / firrtl master")
-  }
-
-  //
-  // Everything else
-  //
-
-  def getModule: T = dut
 
   override def pokeClock(signal: Clock, value: Boolean): Unit = {
     // TODO: check thread ordering
@@ -103,37 +89,6 @@ class ThreadedBackend[T <: Module](
     val a = tester.peek(dataNames(signal))
     logger.debug(s"${resolveName(signal)} -> $a")
     a > 0
-  }
-
-  override def pokeBits(signal: Data, value: BigInt): Unit = {
-    doPoke(signal, value, new Throwable)
-    if (tester.peek(dataNames(signal)) != value) {
-      idleCycles.clear()
-    }
-    tester.poke(dataNames(signal), value)
-    logger.debug(s"${resolveName(signal)} <- $value")
-  }
-
-  override def peekBits(signal: Data, stale: Boolean): BigInt = {
-    require(!stale, "Stale peek not yet implemented")
-
-    doPeek(signal, new Throwable)
-    val a = tester.peek(dataNames(signal))
-    logger.debug(s"${resolveName(signal)} -> $a")
-    a
-  }
-
-  override def expectBits(
-    signal:  Data,
-    value:   BigInt,
-    message: Option[String],
-    decode:  Option[BigInt => String],
-    stale:   Boolean
-  ): Unit = {
-    require(!stale, "Stale peek not yet implemented")
-
-    logger.debug(s"${resolveName(signal)} ?> $value")
-    Context().env.testerExpect(value, peekBits(signal, stale), resolveName(signal), message, decode)
   }
 
   protected val clockCounter: mutable.HashMap[Clock, Int] = mutable.HashMap()
@@ -185,7 +140,7 @@ class ThreadedBackend[T <: Module](
     }
   }
 
-  override def run(testFn: T => Unit): AnnotationSeq = {
+  def run(testFn: T => Unit): AnnotationSeq = {
     rootTimescope = Some(new RootTimescope)
     val mainThread = new TesterThread(
       () => {
@@ -846,7 +801,7 @@ class ThreadedBackend[T <: Module](
     allThreads -= thread
   }
 
-  def doFork(runnable: () => Unit, name: Option[String], region: Option[Region]): TesterThread = {
+  override def doFork(runnable: () => Unit, name: Option[String], region: Option[Region]): TesterThread = {
     val timescope = currentThread.get.getTimescope
     val thisThread = currentThread.get // locally save this thread
     val newRegion = region.getOrElse(thisThread.region)
@@ -871,7 +826,7 @@ class ThreadedBackend[T <: Module](
     newThread
   }
 
-  def doJoin(threads: Seq[AbstractTesterThread], stepAfter: Option[Clock]): Unit = {
+  override def doJoin(threads: Seq[AbstractTesterThread], stepAfter: Option[Clock]): Unit = {
     val thisThread = currentThread.get
     // TODO can this be made more typesafe?
     val joinThreadsTyped = threads.map(_.asInstanceOf[TesterThread])
